@@ -18,6 +18,28 @@ import sys
 from typing import Dict, Any, Optional, List
 from btc_strategy import evaluate_btc_signal
 
+_EN_MAP = {
+    "甲": "Jia", "乙": "Yi", "丙": "Bing", "丁": "Ding", "戊": "Wu",
+    "己": "Ji", "庚": "Geng", "辛": "Xin", "壬": "Ren", "癸": "Gui",
+    "子": "Zi", "丑": "Chou", "寅": "Yin", "卯": "Mao", "辰": "Chen", "巳": "Si",
+    "午": "Wu", "未": "Wei", "申": "Shen", "酉": "You", "戌": "Xu", "亥": "Hai",
+    "妻財": "Wealth", "官鬼": "Ghost", "子孫": "Offspring", "父母": "Parent", "兄弟": "Sibling",
+    "開門": "Open-Door", "休門": "Rest-Door", "生門": "Life-Door", "傷門": "Harm-Door",
+    "杜門": "Delusion-Door", "景門": "Scenery-Door", "死門": "Death-Door", "驚門": "Fear-Door",
+    "天蓬": "TianPeng", "天任": "TianRen", "天沖": "TianChong", "天輔": "TianFu",
+    "天英": "TianYing", "天芮": "TianRui", "天柱": "TianZhu", "天心": "TianXin", "天禽": "TianQin",
+    "值符": "ZhiFu", "螣蛇": "TengShe", "太陰": "TaiYin", "六合": "LiuHe",
+    "白虎": "BaiHu", "玄武": "XuanWu", "九地": "JiuDi", "九天": "JiuTian",
+    "初傳": "1st:", "中傳": "2nd:", "末傳": "3rd:", "時": "h",
+    "評分": "Score", "五不遇時": "WuBuYuShi", "→": "->", "・": " / ", "（": "(", "）": ")",
+}
+
+def to_en(text: str) -> str:
+    for k, v in _EN_MAP.items():
+        text = text.replace(k, v)
+    return text
+
+
 STATE_FILE = os.environ.get("BTC_STATE_FILE", "btc_bot_state.json")
 
 
@@ -70,7 +92,7 @@ def fetch_btc_2h_closes(exchange=None) -> List[float]:
             if ohlcv and len(ohlcv) >= 25:
                 return [float(bar[4]) for bar in ohlcv]
         except Exception as e:
-            print(f"[警告] 透過 CCXT 抓取 2H K 線失敗：{e}")
+            print(f"[WARN] CCXT 2H candle fetch failed: {e}")
 
     # 即時公開行情（免 API Key，支援 AWS 雪梨/全球伺服器即時模擬盤）
     try:
@@ -80,7 +102,7 @@ def fetch_btc_2h_closes(exchange=None) -> List[float]:
                 pub_ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
                 ohlcv = pub_ex.fetch_ohlcv(sym, timeframe="2h", limit=35)
                 if ohlcv and len(ohlcv) >= 25:
-                    print(f"[公開即時行情] 已從 {ex_id.upper()} 取得最新 2 小時 K 線 ({sym})")
+                    print(f"[PUBLIC FEED] Loaded live 2H candles from {ex_id.upper()} ({sym})")
                     return [float(bar[4]) for bar in ohlcv]
             except Exception:
                 continue
@@ -109,7 +131,7 @@ def run_bot_cycle(
     if state.get("halted_until_utc"):
         halt_dt = datetime.datetime.fromisoformat(state["halted_until_utc"])
         if now_utc < halt_dt:
-            msg = f"[熔斷保護中] 暫停交易至 {halt_dt.isoformat()} UTC"
+            msg = f"[CIRCUIT BREAKER] Trading halted until {halt_dt.isoformat()} UTC"
             print(msg)
             return {"action": "HALTED", "message": msg}
         state["halted_until_utc"] = None
@@ -123,10 +145,11 @@ def run_bot_cycle(
     daily_loss_limit = float(os.environ.get("DAILY_MAX_LOSS_PCT", "-3.0"))
 
     print("=" * 68)
-    print(f"【BTC/USDT 大六壬自動交易機器人】{'[DRY-RUN 模擬]' if dry_run else '[LIVE/TESTNET 連線]'}")
-    print(f"時辰：{sig['shichen']}｜現價：${curr_p:,.2f}｜20MA：${sig['ma20']:,.2f}｜RSI5：{sig['rsi5']}")
-    print(f"三傳：{sig['sanchuan']}｜奇門：{sig['qimen']}")
-    print(f"離火共振：{sig['el_score']:+.1f}（{sig['el_note']}）｜系統訊號：{sig['signal']}")
+    mode_lbl = "[PAPER / DRY-RUN]" if dry_run else "[LIVE / TESTNET]"
+    print(f"[BTC/USDT DaLiuRen AutoTrader] {mode_lbl}")
+    print(f"Shichen: {to_en(sig['shichen'])} | Price: ${curr_p:,.2f} | 20MA: ${sig['ma20']:,.2f} | RSI5: {sig['rsi5']}")
+    print(f"SanChuan: {to_en(sig['sanchuan'])} | QiMen: {to_en(sig['qimen'])}")
+    print(f"Fire-Resonance: {sig['el_score']:+.1f} | Signal: {sig['signal']}")
     print("=" * 68)
 
     # 1. 若目前持有倉位，先檢查「觸價停利／停損」或「滿 6 小時（3 個時辰）強制平倉」
@@ -141,7 +164,7 @@ def run_bot_cycle(
         hit_time = held_hours >= 5.9  # 滿 3 個時辰 (6 小時)
 
         if hit_tp or hit_sl or hit_time:
-            reason = "觸及停利" if hit_tp else ("觸及停損" if hit_sl else "滿6小時(3時辰)時間平倉")
+            reason = "Take-Profit" if hit_tp else ("Stop-Loss" if hit_sl else "6H Time-Stop (3 Shichen)")
             raw_ret = ((curr_p - ep) / ep) if pos == "LONG" else ((ep - curr_p) / ep)
             net_ret_pct = round((raw_ret - 0.0006) * 100.0 * max_pos_pct * leverage, 3)
 
@@ -162,13 +185,13 @@ def run_bot_cycle(
 
             if state["daily_pnl_pct"] <= daily_loss_limit:
                 state["halted_until_utc"] = (now_utc + datetime.timedelta(hours=24)).isoformat()
-                print(f"[風控熔斷] 當日累計損益 {state['daily_pnl_pct']}% 觸及上限，暫停開倉 24 小時！")
+                print(f"[CIRCUIT BREAKER] Daily PnL {state['daily_pnl_pct']}% hit limit, halting 24h!")
 
             save_state(state)
-            print(f"[平倉完成] {pos} @ ${ep:,.2f} -> ${curr_p:,.2f}｜原因：{reason}｜帳戶淨損益：{net_ret_pct:+.3f}%")
+            print(f"[CLOSED] {pos} @ ${ep:,.2f} -> ${curr_p:,.2f} | Reason: {reason} | Net PnL: {net_ret_pct:+.3f}%")
             return {"action": f"CLOSE_{pos}", "reason": reason, "pnl_pct": net_ret_pct}
         else:
-            print(f"[持倉續抱] 目前持有 {pos} @ ${ep:,.2f}（已持倉 {held_hours:.1f} 小時，目標 TP=${state['tp_price']} / SL=${state['sl_price']}）")
+            print(f"[HOLDING] {pos} @ ${ep:,.2f} (Held {held_hours:.1f}h | TP=${state['tp_price']} / SL=${state['sl_price']})")
             save_state(state)
             return {"action": f"HOLD_{pos}"}
 
@@ -184,7 +207,7 @@ def run_bot_cycle(
         alloc_usdt = usdt_balance * max_pos_pct * leverage
         qty = round(alloc_usdt / curr_p, 3)
         if qty <= 0:
-            print("[警告] 帳戶餘額不足最小下單單位 (0.001 BTC)，略過開倉。")
+            print("[WARN] Balance below min order size (0.001 BTC), skipping.")
             return {"action": "SKIP_LOW_BALANCE"}
 
         if not dry_run and exchange is not None:
@@ -202,14 +225,15 @@ def run_bot_cycle(
         state["tp_price"] = sig["tp_price"]
         state["sl_price"] = sig["sl_price"]
         save_state(state)
-        print(f"[開倉成功] {side} {qty} BTC @ ${curr_p:,.2f}｜TP=${sig['tp_price']:,.2f} / SL=${sig['sl_price']:,.2f}")
+        print(f"[OPENED] {side} {qty} BTC @ ${curr_p:,.2f} | TP=${sig['tp_price']:,.2f} / SL=${sig['sl_price']:,.2f}")
         return {"action": f"OPEN_{side}", "qty": qty, "price": curr_p}
 
     save_state(state)
-    print("[今日此輪觀望] 無符合大六壬＋離火共振條件之訊號，維持 100% USDT 現金。")
+    print("[WAIT] No qualifying DaLiuRen + Fire-Resonance signal; staying 100% USDT cash.")
     return {"action": "WAIT"}
 
 
 if __name__ == "__main__":
     is_dry = os.environ.get("DRY_RUN", "true").lower() == "true"
     run_bot_cycle(dry_run=is_dry)
+
