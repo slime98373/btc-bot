@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-比特幣 (BTC/USD) 專屬大六壬十二時辰 × 一辰三傳（每40分鐘一傳）× 奇門 × 離火共振策略模組 (btc_strategy.py v11.0)
-========================================================================================================
-支援兩種決策頻率（預設啟用 v11.0 一辰三傳 40 分鐘三段式遞進聯動）：
-  - 初傳・發用 (00–40m, phase 0)：氣機初動，決定首波建倉（若中傳亦同向生扶則提高初始部位至 55%）
-  - 中傳・移易 (40–80m, phase 1)：氣機轉折，空手可半路切入；持倉若同向生旺且浮盈則順勢加碼至 65%；若中傳逢空亡則收緊停損至 -0.55%
-  - 末傳・歸計 (80–120m, phase 2)：時辰收尾，「末傳空亡，事終無成」— 末傳空亡絕不開新倉，且若帳面浮盈 >= +0.35% 立即提前落袋鎖利！
+比特幣 (BTC/USD) 大六壬 v12.0「盤面動態應期（每時辰 0～6 次・動態分鐘觸發）」策略模組 (btc_strategy.py)
+====================================================================================================
+核心機制：
+  1. 依當下時辰大六壬四課三傳、空亡、驛馬、天地盤反吟與奇門局，自動排定該時辰（0–119 分鐘）之：
+     - 休囚閉塞課 (DORMANT_0)：0 次進場評估（全時辰觀望，避開洗盤）
+     - 緩發順行課 (SLOW_1_2) ：1～2 次精準評估（僅在實支應期分鐘啟動）
+     - 常規三傳課 (DYNAMIC_3)：3 次動態應期分鐘評估（依傳支天盤位移＋太玄數定分鐘，避開整點插針）
+     - 驛馬交戰課 (INTENSE_4_6)：4～6 次高頻密集評估（納入四課動爻與時支六沖分刻，捕捉急拉與V轉）
+  2. 每 5 分鐘巡檢一次：
+     - 持倉中：每 5 分鐘即時監控停利(+1.5%)、停損(-0.9%)、末傳空亡提前鎖利(>=+0.35%)、中傳空亡緊縮停損(<=-0.55%)
+     - 空手中：僅在時辰內命中「應期分鐘 (eval_minutes)」時才啟動開倉評估！
 """
 
 import datetime
 from typing import Dict, Any, List
-from daliuren_engine import cast_daily_tsmc_chart, STEMS, BRANCHES, BRANCH_WUXING, wuxing_generates, wuxing_controls
+from daliuren_engine import cast_daily_tsmc_chart, STEMS, BRANCHES, STEM_WUXING, BRANCH_WUXING, wuxing_generates, wuxing_controls
+
+TAIXUAN_NUM = {
+    "子": 9, "午": 9, "丑": 8, "未": 8, "寅": 7, "申": 7,
+    "卯": 6, "酉": 6, "辰": 5, "戌": 5, "巳": 4, "亥": 4,
+}
+
+SIX_CLASH = {
+    "子": "午", "午": "子", "丑": "未", "未": "丑", "寅": "申", "申": "寅",
+    "卯": "酉", "酉": "卯", "辰": "戌", "戌": "辰", "巳": "亥", "亥": "巳",
+}
 
 
 def calc_shichen_qimen(chart) -> Dict[str, Any]:
@@ -55,7 +70,6 @@ def calc_shichen_qimen(chart) -> Dict[str, Any]:
 
 
 def calc_btc_fire_resonance(chart) -> Dict[str, Any]:
-    """計算當前時辰盤面對比特幣【離火本命・午宮】的專屬五行共振分數"""
     el, palace = "火", "午"
     m_wx = BRANCH_WUXING[chart.pillars["month_branch"]]
     score = 0.0
@@ -96,115 +110,216 @@ def calc_btc_fire_resonance(chart) -> Dict[str, Any]:
     return {"el_score": round(score, 1), "el_note": "｜".join(notes)}
 
 
-def get_shichen_phase(dt_tw: datetime.datetime) -> Dict[str, Any]:
+def compute_dynamic_shichen_schedule(chart, qimen: Dict[str, Any], el_score: float) -> Dict[str, Any]:
     """
-    計算當前台灣時間處於該時辰的第幾分鐘與對應三傳段落：
-      - 奇數整點 (01, 03, 05, ..., 23) 為時辰起點 (第 0 分鐘)
-      - 00–39 分鐘 -> phase_idx = 0 (初傳・發用 1st-Chuan)
-      - 40–79 分鐘 -> phase_idx = 1 (中傳・移易 2nd-Chuan)
-      - 80–119 分鐘 -> phase_idx = 2 (末傳・歸計 3rd-Chuan)
+    計算當前時辰（0–119 分鐘）之動態應期評估分鐘列表 (對齊 5 分鐘刻度：0, 5, 10, ..., 115)
     """
-    mins = dt_tw.minute if (dt_tw.hour % 2 == 1) else (60 + dt_tw.minute)
-    if mins < 40:
-        return {"phase_idx": 0, "mins": mins, "phase_zh": "初傳・發用(00-40m)", "phase_en": "1st-Chuan(00-40m)"}
-    elif mins < 80:
-        return {"phase_idx": 1, "mins": mins, "phase_zh": "中傳・移易(40-80m)", "phase_en": "2nd-Chuan(40-80m)"}
-    else:
-        return {"phase_idx": 2, "mins": mins, "phase_zh": "末傳・歸計(80-120m)", "phase_en": "3rd-Chuan(80-120m)"}
+    tt = chart.three_transmissions
+    sike = chart.four_lessons
+    hour_b = chart.pillars["hour_branch"]
+    hour_idx = BRANCHES.index(hour_b)
+
+    lqs = [t["liuqin"] for t in tt]
+    gens = [t["general"] for t in tt]
+    kws = [t["kongwang"] == "空亡" for t in tt]
+    branches = [t["branch"] for t in tt]
+
+    void_count = sum(1 for k in kws if k)
+    has_horse = any(b in ("寅", "申", "巳", "亥") for b in branches)
+    is_fanyin = (SIX_CLASH.get(chart.heaven_plate[hour_b]) == hour_b)
+    fierce_generals = sum(1 for g in gens if g in ("白虎", "螣蛇", "玄武"))
+    active_wealth_ghost = ("妻財" in lqs and "官鬼" in lqs) or (abs(el_score) >= 8.0 and abs(qimen["q_score"]) >= 20)
+
+    if void_count >= 2 or (kws[0] and qimen["door"] in ("杜門", "傷門") and abs(el_score) <= 4.0):
+        return {
+            "mode_en": "DORMANT_0 (0 checks - Chop Filter)",
+            "eval_count": 0,
+            "eval_minutes": [],
+            "slot_meta": {},
+        }
+
+    base_minutes = []
+    slot_meta = {}
+    for i, t in enumerate(tt):
+        if kws[i]:
+            continue
+        b = t["branch"]
+        b_idx = BRANCHES.index(b)
+        offset_branch = (b_idx - hour_idx) % 12
+        tx = TAIXUAN_NUM[b]
+        within_40 = ((offset_branch * 3 + tx) % 7) * 5 + 5
+        minute_mark = min(115, i * 40 + within_40)
+        base_minutes.append(minute_mark)
+        slot_meta[minute_mark] = {
+            "source": f"{['1st','2nd','3rd'][i]}({b})",
+            "liuqin": t["liuqin"],
+            "general": t["general"],
+            "kongwang": False,
+            "is_main_chuan": True,
+        }
+
+    if is_fanyin or (has_horse and active_wealth_ghost) or (fierce_generals >= 2 and abs(el_score) >= 6.0):
+        extra_branches = [sike[0]["top"], sike[2]["top"], SIX_CLASH[hour_b]]
+        day_wx = STEM_WUXING[chart.pillars["day_stem"]]
+        for eb in extra_branches:
+            eb_idx = BRANCHES.index(eb)
+            m_mark = min(115, eb_idx * 10)
+            if m_mark not in slot_meta:
+                eb_wx = BRANCH_WUXING[eb]
+                if eb_wx == day_wx:
+                    eb_lq = "兄弟"
+                elif wuxing_generates(day_wx, eb_wx):
+                    eb_lq = "子孫"
+                elif wuxing_generates(eb_wx, day_wx):
+                    eb_lq = "父母"
+                elif wuxing_controls(day_wx, eb_wx):
+                    eb_lq = "妻財"
+                else:
+                    eb_lq = "官鬼"
+                eb_gen = chart.generals_plate[eb]
+                eb_kw = eb in chart.pillars["kongwang"]
+                if not eb_kw:
+                    base_minutes.append(m_mark)
+                    slot_meta[m_mark] = {
+                        "source": f"SiKe/Clash({eb})",
+                        "liuqin": eb_lq,
+                        "general": eb_gen,
+                        "kongwang": False,
+                        "is_main_chuan": False,
+                    }
+        eval_mins = sorted(set(base_minutes))[:6]
+        return {
+            "mode_en": f"INTENSE_{len(eval_mins)} ({len(eval_mins)} checks - High Volatility)",
+            "eval_count": len(eval_mins),
+            "eval_minutes": eval_mins,
+            "slot_meta": slot_meta,
+        }
+
+    if len(base_minutes) <= 2 or (qimen["deity"] in ("九地", "太陰") and not has_horse):
+        eval_mins = sorted(set(base_minutes))[:2]
+        return {
+            "mode_en": f"SLOW_{len(eval_mins)} ({len(eval_mins)} checks - Steady)",
+            "eval_count": len(eval_mins),
+            "eval_minutes": eval_mins,
+            "slot_meta": slot_meta,
+        }
+
+    eval_mins = sorted(set(base_minutes))
+    return {
+        "mode_en": f"DYNAMIC_{len(eval_mins)} ({len(eval_mins)} checks - Standard YingQi)",
+        "eval_count": len(eval_mins),
+        "eval_minutes": eval_mins,
+        "slot_meta": slot_meta,
+    }
 
 
-def evaluate_btc_signal(closes: List[float], dt_tw: datetime.datetime = None) -> Dict[str, Any]:
+def evaluate_btc_signal(closes_5m: List[float], dt_tw: datetime.datetime = None, force_eval: bool = False) -> Dict[str, Any]:
     """
-    輸入 K 線收盤價序列，依當前時辰落點（初傳/中傳/末傳）回傳 v11.0 三段式遞進交易訊號與動態風控參數
+    輸入 5 分鐘 K 線序列（建議至少 480 根 = 20 個時辰），回傳 v12.0 動態應期排程與當下訊號
     """
     if dt_tw is None:
         dt_tw = datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
 
-    curr_p = closes[-1]
-    ma_len = min(60, len(closes)) if len(closes) >= 60 else min(20, len(closes))
-    ma20 = sum(closes[-ma_len:]) / float(ma_len)
-    ma20_prev = sum(closes[-ma_len - 5:-5]) / float(ma_len) if len(closes) >= (ma_len + 5) else ma20
-    slope = (ma20 - ma20_prev) / ma20_prev * 100.0
+    curr_p = closes_5m[-1]
+    ma_len = min(480, len(closes_5m))
+    ma20_sc = sum(closes_5m[-ma_len:]) / float(ma_len)
+    ma_prev = sum(closes_5m[-ma_len - 20:-20]) / float(ma_len) if len(closes_5m) >= (ma_len + 20) else ma20_sc
+    slope = (ma20_sc - ma_prev) / ma_prev * 100.0
+    mom_15m = (curr_p - closes_5m[-4]) / closes_5m[-4] * 100.0 if len(closes_5m) >= 4 else 0.0
 
     gains, losses = [], []
-    for j in range(len(closes) - 5, len(closes)):
-        d = closes[j] - closes[j - 1]
+    for j in range(max(1, len(closes_5m) - 12), len(closes_5m)):
+        d = closes_5m[j] - closes_5m[j - 1]
         if d > 0:
             gains.append(d)
         else:
             losses.append(-d)
-    rsi5 = 100.0 if sum(losses) == 0 else 100.0 - (100.0 / (1.0 + (sum(gains) / 5.0) / (sum(losses) / 5.0)))
+    rsi = 100.0 if sum(losses) == 0 else 100.0 - (100.0 / (1.0 + (sum(gains) / 12.0) / (sum(losses) / 12.0)))
 
     chart = cast_daily_tsmc_chart(dt_tw)
     q = calc_shichen_qimen(chart)
     res_el = calc_btc_fire_resonance(chart)
     el_score = res_el["el_score"]
-    ph = get_shichen_phase(dt_tw)
-    phase_idx = ph["phase_idx"]
+    sched = compute_dynamic_shichen_schedule(chart, q, el_score)
+
+    raw_mins = dt_tw.minute if (dt_tw.hour % 2 == 1) else (60 + dt_tw.minute)
+    slot_5m = (raw_mins // 5) * 5
+    phase_idx = min(2, raw_mins // 40)
 
     tt = chart.three_transmissions
     lqs = [t["liuqin"] for t in tt]
     gens = [t["general"] for t in tt]
     kws = [t["kongwang"] == "空亡" for t in tt]
 
-    lq_curr = lqs[phase_idx]
-    gen_curr = gens[phase_idx]
-    kw_curr = kws[phase_idx]
+    is_eval_minute = (slot_5m in sched["eval_minutes"]) or force_eval
+    active_lq = lqs[phase_idx]
+    active_gen = gens[phase_idx]
+    active_kw = kws[phase_idx]
+    trigger_source = f"{['1st','2nd','3rd'][phase_idx]}({tt[phase_idx]['branch']})"
 
-    bull_trap = (lq_curr == "妻財" and kw_curr) or (lq_curr == "父母" and gen_curr in ("螣蛇", "玄武"))
-    long_sig = (not bull_trap) and (not q["wubuyushi"]) and q["good_door"] and (q["q_score"] >= 15) and (el_score >= -3.0) and (
-        lq_curr in ("妻財", "子孫", "父母") and not kw_curr
-    ) and (curr_p >= ma20 * 0.996 or rsi5 <= 30.0)
+    if slot_5m in sched["slot_meta"]:
+        meta = sched["slot_meta"][slot_5m]
+        trigger_source = meta["source"]
+        if meta.get("is_main_chuan", True):
+            active_lq = meta["liuqin"]
+            active_gen = meta["general"]
+            active_kw = meta["kongwang"]
+        elif active_kw and not kws[0]:
+            active_lq, active_gen, active_kw = lqs[0], gens[0], kws[0]
 
-    short_sig = (not long_sig) and (slope < 0.25) and (el_score <= 5.0) and (
-        (q["door"] in ("死門", "驚門") or q["wubuyushi"]) and (lq_curr in ("官鬼", "兄弟") or gen_curr in ("白虎", "玄武"))
-    ) and (curr_p < ma20 * 1.002) and (rsi5 >= 28.0)
+    bull_trap = (active_lq == "妻財" and active_kw) or (active_lq == "父母" and active_gen in ("螣蛇", "玄武"))
+    long_sig = is_eval_minute and (not bull_trap) and (not q["wubuyushi"]) and q["good_door"] and (q["q_score"] >= 15) and (el_score >= -3.0) and (
+        active_lq in ("妻財", "子孫", "父母") and not active_kw
+    ) and (curr_p >= ma20_sc * 0.996) and (mom_15m >= -0.05)
 
-    # 末傳逢空亡（「末傳空亡，事終無成」）絕不追高開新倉
-    if phase_idx == 2 and kw_curr:
+    short_sig = is_eval_minute and (not long_sig) and (slope < 0.25) and (el_score <= 5.0) and (
+        (q["door"] in ("死門", "驚門") or q["wubuyushi"]) and (active_lq in ("官鬼", "兄弟") or active_gen in ("白虎", "玄武"))
+    ) and (curr_p < ma20_sc * 1.002) and (mom_15m <= 0.05)
+
+    if phase_idx == 2 and active_kw:
         long_sig = False
         short_sig = False
 
     signal = "LONG" if long_sig else ("SHORT" if short_sig else "HOLD")
-    tp_pct = 0.015   # v11.0 三傳模式停利 +1.5%
-    sl_pct = 0.009   # v11.0 三傳模式停損 -0.9%
+    tp_pct = 0.015
+    sl_pct = 0.009
 
     if signal == "LONG":
         tp_price = round(curr_p * (1.0 + tp_pct), 2)
         sl_price = round(curr_p * (1.0 - sl_pct), 2)
-        rec_size = 0.55 if (phase_idx == 0 and lqs[1] in ("妻財", "子孫") and not kws[1]) else 0.50
+        rec_size = 0.55 if (sched["eval_count"] >= 4) else 0.50
     elif signal == "SHORT":
         tp_price = round(curr_p * (1.0 - tp_pct), 2)
         sl_price = round(curr_p * (1.0 + sl_pct), 2)
-        rec_size = 0.55 if (phase_idx == 0 and lqs[1] in ("官鬼", "兄弟") and not kws[1]) else 0.50
+        rec_size = 0.55 if (sched["eval_count"] >= 4) else 0.50
     else:
         tp_price, sl_price, rec_size = 0.0, 0.0, 0.0
 
-    # 中傳順勢加碼條件與末傳空亡提前鎖利標記
-    scale_long_ok = (phase_idx == 1) and (lq_curr in ("妻財", "子孫", "父母") and not kw_curr)
-    scale_short_ok = (phase_idx == 1) and (lq_curr in ("官鬼", "兄弟") and not kw_curr)
-    kw_lock_profit = (phase_idx == 2) and kw_curr
-    tight_stop_middle = (phase_idx == 1) and kw_curr
-
-    active_chuan_str = f"{['初傳','中傳','末傳'][phase_idx]}{tt[phase_idx]['branch']}({lq_curr}/{gen_curr}/{'空亡' if kw_curr else '實'})"
+    next_mins = [m for m in sched["eval_minutes"] if m > slot_5m]
+    scale_long_ok = is_eval_minute and (active_lq in ("妻財", "子孫", "父母") and not active_kw)
+    scale_short_ok = is_eval_minute and (active_lq in ("官鬼", "兄弟") and not active_kw)
 
     return {
         "signal": signal,
+        "is_eval_minute": is_eval_minute,
+        "raw_mins": raw_mins,
+        "slot_5m": slot_5m,
+        "sched_mode_en": sched["mode_en"],
+        "eval_minutes": sched["eval_minutes"],
+        "next_minutes": next_mins,
+        "trigger_source": trigger_source,
         "shichen": f"{chart.pillars['hour_ganzhi']}（{q['hour_branch']}時）",
         "phase_idx": phase_idx,
-        "phase_en": ph["phase_en"],
-        "phase_zh": ph["phase_zh"],
-        "active_chuan": active_chuan_str,
-        "curr_kw": kw_curr,
+        "active_chuan": f"{trigger_source}:{active_lq}/{active_gen}/{'Void' if active_kw else 'Solid'}",
         "recommended_size_pct": rec_size,
         "scale_long_ok": scale_long_ok,
         "scale_short_ok": scale_short_ok,
-        "kw_lock_profit": kw_lock_profit,
-        "tight_stop_middle": tight_stop_middle,
+        "kw_lock_profit": (phase_idx == 2 and kws[2]),
+        "tight_stop_middle": (phase_idx == 1 and kws[1]),
         "price": round(curr_p, 2),
-        "ma20": round(ma20, 2),
-        "ma20_slope_pct": round(slope, 3),
-        "rsi5": round(rsi5, 1),
+        "ma20": round(ma20_sc, 2),
+        "mom_15m_pct": round(mom_15m, 3),
+        "rsi5": round(rsi, 1),
         "tp_price": tp_price,
         "sl_price": sl_price,
         "el_score": el_score,
