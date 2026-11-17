@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-比特幣 (BTC/USDT) 大六壬 v11.0「一辰三傳・每40分鐘判斷1次（單時辰3次決策）」全自動下單機器人 (btc_autotrader.py)
-================================================================================================================
-升級亮點 (v11.0 3-Phase SanChuan Progressive Engine)：
-  1. 每個時辰（120 分鐘）拆為 3 段，每 40 分鐘執行 1 次（台灣時間奇數點 01分、41分，偶數點 21分）：
-     - Phase 0 [1st-Chuan 00-40m 初傳發用]：氣機起勢，符合條件建立 50%~55% 部位
-     - Phase 1 [2nd-Chuan 40-80m 中傳移易]：空手可半路切入；若持倉且中傳同向生旺+浮盈則順勢加碼至 65%；若中傳逢空亡且虧損逾 -0.55% 提早停損逃命
-     - Phase 2 [3rd-Chuan 80-120m 末傳歸計]：末傳逢空亡絕不開新倉；若持倉遇末傳空亡且浮盈 >= +0.35% 立即提前落袋鎖利！
-  2. 純英文終端機輸出 (Web Console 零亂碼)，內建免金鑰公開即時 K 線 (OKX / Kraken / Coinbase / Gate) 與五大風控鎖。
+比特幣 (BTC/USDT) 大六壬 v12.0「盤面動態應期（每時辰 0～6 次・動態分鐘觸發）」全自動交易機器人 (btc_autotrader.py)
+====================================================================================================================
+運作方式：
+  - 系統排程每 5 分鐘自動巡檢一次 (*/5 * * * *)
+  - 若持有倉位：每 5 分鐘密集檢查停利(+1.5%)、停損(-0.9%)、末傳空亡提前鎖利(>=+0.35%)、中傳空亡提早停損(<=-0.55%)
+  - 若目前空手：僅在當前分鐘命中大六壬盤面排定的「應期分鐘 (eval_minutes)」時才啟動開倉決策（可加 --force 參數手動強制測試）
 """
 
 import datetime
@@ -52,7 +50,7 @@ def load_state() -> Dict[str, Any]:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {
-        "position": None,          # None / "LONG" / "SHORT"
+        "position": None,
         "entry_price": 0.0,
         "amount": 0.0,
         "pos_pct": 0.50,
@@ -91,46 +89,36 @@ def get_exchange():
     return ex
 
 
-def fetch_btc_40m_closes(exchange=None) -> List[float]:
-    """
-    抓取最新 5 分鐘 K 線並每 8 根合成 1 根 40 分鐘（一傳）K 線；若無則降級抓 1h/2h K 線
-    """
+def fetch_btc_5m_closes(exchange=None) -> List[float]:
     if exchange is not None:
         try:
-            ohlcv_5m = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="5m", limit=520)
-            if ohlcv_5m and len(ohlcv_5m) >= 200:
-                closes_5m = [float(bar[4]) for bar in ohlcv_5m]
-                closes_40m = closes_5m[7::8]
-                if closes_40m[-1] != closes_5m[-1]:
-                    closes_40m.append(closes_5m[-1])
-                return closes_40m[-65:]
+            ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="5m", limit=500)
+            if ohlcv and len(ohlcv) >= 120:
+                return [float(bar[4]) for bar in ohlcv]
         except Exception as e:
-            print(f"[WARN] CCXT authenticated 5m/40m fetch failed: {e}")
+            print(f"[WARN] CCXT authenticated 5m fetch failed: {e}")
 
     try:
         import ccxt
         for ex_id, sym in [("okx", "BTC/USDT"), ("kraken", "BTC/USD"), ("coinbase", "BTC/USD"), ("gate", "BTC/USDT")]:
             try:
                 pub_ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
-                ohlcv_5m = pub_ex.fetch_ohlcv(sym, timeframe="5m", limit=520)
-                if ohlcv_5m and len(ohlcv_5m) >= 200:
-                    closes_5m = [float(bar[4]) for bar in ohlcv_5m]
-                    closes_40m = closes_5m[7::8]
-                    if closes_40m[-1] != closes_5m[-1]:
-                        closes_40m.append(closes_5m[-1])
-                    print(f"[PUBLIC FEED] Loaded live 40m (SanChuan) candles from {ex_id.upper()} ({sym})")
-                    return closes_40m[-65:]
+                ohlcv = pub_ex.fetch_ohlcv(sym, timeframe="5m", limit=300)
+                if ohlcv and len(ohlcv) >= 100:
+                    print(f"[PUBLIC FEED] Loaded {len(ohlcv)} live 5m candles from {ex_id.upper()} ({sym})")
+                    return [float(bar[4]) for bar in ohlcv]
             except Exception:
                 continue
     except Exception:
         pass
 
     base = 64012.79
-    return [round(base * (1.0 + ((i % 7) - 3) * 0.0025), 2) for i in range(65)]
+    return [round(base * (1.0 + ((i % 9) - 4) * 0.0018), 2) for i in range(500)]
 
 
 def run_bot_cycle(
     dry_run: bool = True,
+    force_eval: bool = False,
     simulated_closes: Optional[List[float]] = None,
     simulated_dt_tw: Optional[datetime.datetime] = None,
 ) -> Dict[str, Any]:
@@ -151,22 +139,23 @@ def run_bot_cycle(
         state["halted_until_utc"] = None
 
     exchange = None if dry_run else get_exchange()
-    closes = simulated_closes if simulated_closes is not None else fetch_btc_40m_closes(exchange)
-    sig = evaluate_btc_signal(closes, simulated_dt_tw)
+    closes_5m = simulated_closes if simulated_closes is not None else fetch_btc_5m_closes(exchange)
+    sig = evaluate_btc_signal(closes_5m, simulated_dt_tw, force_eval=force_eval)
     curr_p = sig["price"]
     leverage = int(os.environ.get("LEVERAGE", "1"))
     daily_loss_limit = float(os.environ.get("DAILY_MAX_LOSS_PCT", "-3.0"))
 
     mode_lbl = "[PAPER / DRY-RUN]" if dry_run else "[LIVE / TESTNET]"
-    print("=" * 76)
-    print(f"[BTC/USDT DaLiuRen v11.0 3-Phase AutoTrader] {mode_lbl}")
-    print(f"Shichen: {to_en(sig['shichen'])} | Phase: {sig['phase_en']} | Active: {to_en(sig['active_chuan'])}")
-    print(f"Price: ${curr_p:,.2f} | 20MA: ${sig['ma20']:,.2f} | RSI5: {sig['rsi5']}")
+    print("=" * 80)
+    print(f"[BTC/USDT DaLiuRen v12.0 Dynamic-YingQi AutoTrader] {mode_lbl}")
+    print(f"Shichen: {to_en(sig['shichen'])} | Min: {sig['raw_mins']}m (Slot {sig['slot_5m']}m) | Mode: {sig['sched_mode_en']}")
+    print(f"Scheduled YingQi Minutes (0-119m): {sig['eval_minutes']} | Active Check: {'YES' if sig['is_eval_minute'] else 'STANDBY'}")
+    print(f"Price: ${curr_p:,.2f} | 20MA: ${sig['ma20']:,.2f} | 15m-Mom: {sig['mom_15m_pct']:+.2f}% | RSI: {sig['rsi5']}")
     print(f"SanChuan: {to_en(sig['sanchuan'])} | QiMen: {to_en(sig['qimen'])}")
-    print(f"Fire-Resonance: {sig['el_score']:+.1f} | Phase Signal: {sig['signal']}")
-    print("=" * 76)
+    print(f"Fire-Resonance: {sig['el_score']:+.1f} | Trigger: {to_en(sig['active_chuan'])} | Signal: {sig['signal']}")
+    print("=" * 80)
 
-    # 1. 若目前持有倉位，先檢查「三傳動態加減碼 / 末傳空亡提前鎖利 / 中傳空亡緊縮停損 / 停利停損 / 滿4小時(6傳)平倉」
+    # 1. 若目前持有倉位，每 5 分鐘密集監控停利 / 停損 / 末傳空亡鎖利 / 中傳空亡緊縮停損 / 應期反手與加碼
     if state["position"] is not None:
         pos = state["position"]
         ep = state["entry_price"]
@@ -175,19 +164,17 @@ def run_bot_cycle(
         held_hours = (now_utc - entry_dt).total_seconds() / 3600.0
         raw_ret = ((curr_p - ep) / ep) if pos == "LONG" else ((ep - curr_p) / ep)
 
-        # (A) 中傳 (Phase 1) 順勢加碼檢查
-        if (not state.get("scaled", False)) and raw_ret > 0.0015:
+        if sig["is_eval_minute"] and (not state.get("scaled", False)) and raw_ret > 0.0015:
             if (pos == "LONG" and sig["scale_long_ok"]) or (pos == "SHORT" and sig["scale_short_ok"]):
                 state["pos_pct"] = 0.65
                 state["scaled"] = True
                 pos_pct = 0.65
-                print(f"[2ND-CHUAN SCALE-UP] {pos} supported by 2nd-Chuan; position scaled up to 65%!")
+                print(f"[YINGQI SCALE-UP] {pos} confirmed at minute {sig['slot_5m']}m; position scaled up to 65%!")
 
-        # (B) 檢查各項出場條件
         hit_tp = (pos == "LONG" and curr_p >= state["tp_price"]) or (pos == "SHORT" and curr_p <= state["tp_price"])
         hit_sl = (pos == "LONG" and curr_p <= state["sl_price"]) or (pos == "SHORT" and curr_p >= state["sl_price"])
-        hit_time = held_hours >= 3.95  # 滿 6 傳 (4 小時 = 2 個時辰)
-        opp_reversal = (pos == "LONG" and sig["signal"] == "SHORT") or (pos == "SHORT" and sig["signal"] == "LONG")
+        hit_time = held_hours >= 3.95
+        opp_reversal = sig["is_eval_minute"] and ((pos == "LONG" and sig["signal"] == "SHORT") or (pos == "SHORT" and sig["signal"] == "LONG"))
         kw_lock = sig["kw_lock_profit"] and (raw_ret >= 0.0035)
         tight_sl = sig["tight_stop_middle"] and (raw_ret <= -0.0055)
 
@@ -195,15 +182,15 @@ def run_bot_cycle(
             if hit_tp:
                 reason = "Take-Profit (+1.5%)"
             elif kw_lock:
-                reason = "3rd-Chuan Void Profit-Lock (末傳空亡提前鎖利)"
+                reason = "3rd-Chuan Void Profit-Lock"
             elif tight_sl:
-                reason = "2nd-Chuan Void Tight-Stop (中傳空亡提早逃命)"
+                reason = "2nd-Chuan Void Tight-Stop"
             elif opp_reversal:
-                reason = f"SanChuan Signal Reversal -> {sig['signal']}"
+                reason = f"YingQi Reversal -> {sig['signal']}"
             elif hit_sl:
                 reason = "Stop-Loss (-0.9%)"
             else:
-                reason = "6-Chuan (4H) Time-Stop"
+                reason = "4H Time-Stop"
 
             net_ret_pct = round((raw_ret - 0.0006) * 100.0 * pos_pct * leverage, 3)
 
@@ -215,7 +202,7 @@ def run_bot_cycle(
             state["daily_pnl_pct"] = round(state["daily_pnl_pct"] + net_ret_pct, 3)
             state["trade_history"].append({
                 "side": pos, "entry": ep, "exit": curr_p, "pnl_pct": net_ret_pct,
-                "reason": to_en(reason), "time_utc": now_utc.isoformat()
+                "reason": reason, "time_utc": now_utc.isoformat()
             })
             state["position"] = None
             state["entry_price"] = 0.0
@@ -229,14 +216,20 @@ def run_bot_cycle(
                 print(f"[CIRCUIT BREAKER] Daily PnL {state['daily_pnl_pct']}% hit limit, halting 24h!")
 
             save_state(state)
-            print(f"[CLOSED] {pos} @ ${ep:,.2f} -> ${curr_p:,.2f} | Reason: {to_en(reason)} | Net PnL: {net_ret_pct:+.3f}%")
-            return {"action": f"CLOSE_{pos}", "reason": to_en(reason), "pnl_pct": net_ret_pct}
+            print(f"[CLOSED] {pos} @ ${ep:,.2f} -> ${curr_p:,.2f} | Reason: {reason} | Net PnL: {net_ret_pct:+.3f}%")
+            return {"action": f"CLOSE_{pos}", "reason": reason, "pnl_pct": net_ret_pct}
         else:
-            print(f"[HOLDING] {pos} ({int(pos_pct*100)}%) @ ${ep:,.2f} (Held {held_hours:.1f}h | TP=${state['tp_price']} / SL=${state['sl_price']})")
+            print(f"[HOLDING] {pos} ({int(pos_pct*100)}%) @ ${ep:,.2f} (Held {held_hours:.2f}h | Unrealized: {raw_ret*100:+.2f}% | TP=${state['tp_price']} / SL=${state['sl_price']})")
             save_state(state)
             return {"action": f"HOLD_{pos}"}
 
-    # 2. 若空手且當傳出現明確 LONG / SHORT 訊號（且非末傳空亡），自動開倉
+    # 2. 若目前空手，先檢查當下是否為盤面排定之「應期分鐘」
+    if not sig["is_eval_minute"]:
+        print(f"[STANDBY] Minute {sig['raw_mins']}m is not a scheduled YingQi trigger. Next trigger(s) in this Shichen: {sig['next_minutes']}")
+        save_state(state)
+        return {"action": "STANDBY"}
+
+    # 3. 命中應期分鐘且出現明確 LONG / SHORT 訊號，自動開倉
     if sig["signal"] in ("LONG", "SHORT"):
         side = sig["signal"]
         pos_pct = float(sig.get("recommended_size_pct", 0.50))
@@ -268,12 +261,18 @@ def run_bot_cycle(
         state["tp_price"] = sig["tp_price"]
         state["sl_price"] = sig["sl_price"]
         save_state(state)
-        print(f"[OPENED] {side} {qty} BTC ({int(pos_pct*100)}% alloc) @ ${curr_p:,.2f} | Phase: {sig['phase_en']} | TP=${sig['tp_price']:,.2f} / SL=${sig['sl_price']:,.2f}")
+        print(f"[OPENED] {side} {qty} BTC ({int(pos_pct*100)}% alloc) @ ${curr_p:,.2f} | YingQi Slot: {sig['slot_5m']}m | TP=${sig['tp_price']:,.2f} / SL=${sig['sl_price']:,.2f}")
         return {"action": f"OPEN_{side}", "qty": qty, "price": curr_p}
 
     save_state(state)
-    print(f"[WAIT] No entry in {sig['phase_en']}; staying 100% USDT cash.")
+    print(f"[WAIT] YingQi trigger at {sig['slot_5m']}m evaluated -> No entry signal; staying 100% USDT cash.")
     return {"action": "WAIT"}
+
+
+if __name__ == "__main__":
+    is_dry = os.environ.get("DRY_RUN", "true").lower() == "true"
+    force_flag = ("--force" in sys.argv)
+    run_bot_cycle(dry_run=is_dry, force_eval=force_flag)
 
 
 if __name__ == "__main__":
