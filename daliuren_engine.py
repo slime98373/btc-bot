@@ -201,7 +201,13 @@ def derive_three_transmissions(day_stem: str, day_branch: str, yuejiang: str, ho
         else:
             chosen, keti = (k1_top, "伏吟課（自任）") if day_yy == "陽" else (k3_top, "伏吟課（自信）")
         zhong = BRANCH_XING[chosen]
-        if zhong == chosen: zhong = k3_top if chosen == k1_top and k3_top != chosen else BRANCH_CHONG[chosen]
+        if zhong == chosen:
+            if chosen == k1_top and k3_top != chosen:
+                zhong = k3_top
+            elif chosen == k3_top and k1_top != chosen:
+                zhong = k1_top
+            else:
+                zhong = BRANCH_CHONG[chosen]
         mo = BRANCH_XING[zhong]
         if mo == zhong or mo == chosen: mo = BRANCH_CHONG[zhong]
         return [chosen, zhong, mo], keti
