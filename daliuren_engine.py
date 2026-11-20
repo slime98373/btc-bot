@@ -301,7 +301,7 @@ def evaluate_intraday_windows(target_date: datetime.date, day_chart_score: float
         results.append({"shichen": shichen, "time_range": time_range, "phase_desc": phase_desc, "hour_ganzhi": pillars["hour_ganzhi"], "method_name": m_name, "san_chuan": f"{tb[0]}→{tb[1]}→{tb[2]}", "chu_general": f"{chu['branch']}乘{chu['general']}", "stock_branch_top": f"{k3['top']}乘{k3['general']}({k3['liuqin']})", "score": sc, "action": action, "detail": chu["interpretation"]})
     return results
 
-def cast_daily_tsmc_chart(target_dt: Optional[datetime.datetime] = None) -> DaLiuRenChart:
+def cast_daily_tsmc_chart(target_dt: Optional[datetime.datetime] = None, include_intraday: bool = False) -> DaLiuRenChart:
     if target_dt is None:
         now_tw = datetime.datetime.now(datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
         target_dt = datetime.datetime(now_tw.year, now_tw.month, now_tw.day, 9, 0, 0)
@@ -311,5 +311,5 @@ def cast_daily_tsmc_chart(target_dt: Optional[datetime.datetime] = None) -> DaLi
     four_lessons = build_four_lessons(pillars["day_stem"], pillars["day_branch"], heaven_plate, generals_plate)
     trans_branches, method_name = derive_three_transmissions(pillars["day_stem"], pillars["day_branch"], pillars["yuejiang"], pillars["hour_branch"], heaven_plate, four_lessons)
     trans_details, total_score, signal_label, trend_summary, key_factors = evaluate_stock_divination(pillars, heaven_plate, generals_plate, four_lessons, trans_branches, method_name)
-    intraday_windows = evaluate_intraday_windows(target_dt.date(), total_score)
+    intraday_windows = evaluate_intraday_windows(target_dt.date(), total_score) if include_intraday else []
     return DaLiuRenChart(dt_str=target_dt.strftime("%Y-%m-%d %H:%M"), pillars=pillars, heaven_plate=heaven_plate, generals_plate=generals_plate, guiren_direction=guiren_dir, four_lessons=four_lessons, three_transmissions=trans_details, method_name=method_name, total_score=total_score, signal_label=signal_label, trend_summary=trend_summary, intraday_windows=intraday_windows, key_factors=key_factors)
